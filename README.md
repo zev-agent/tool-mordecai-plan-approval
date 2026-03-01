@@ -89,4 +89,4 @@ All secrets (Discord tokens, API keys) are handled by the `openclaw` CLI at runt
 
 ---
 
-Built by Signet for the BOS-Development agent team.
+Built by Signet for the zev agents team.
