@@ -1,0 +1,53 @@
+--- a/scripts/queue.sh
++++ b/scripts/queue.sh
+@@ -5,6 +5,7 @@
+ #   queue.sh list                          — print all items with status
+ #   queue.sh add <issue> <repo> <title>    — add new queued item
+ #   queue.sh set <issue> <field> <value>   — update any field
++#     (supports skip_plan: true/false — skip planning phase for trivial fixes)
+ #   queue.sh next                          — print the next queued item (lowest priority, no unmet depends_on)
+ #   queue.sh done <issue>                  — mark as merged/done
+ #   queue.sh block <issue> <reason>        — mark as blocked with note
++#
++# Trivial fix definition (all must be true to set skip_plan: true):
++#   - Single file change (two files max, clearly identified)
++#   - No DB migrations
++#   - No new API endpoints
++#   - No new UI components
++#   - Fix is a value change, missing case, or typo — not new behavior
+
+ set -e
+
+@@ -36,7 +44,8 @@
+ for item in queue:
+     issue = item.get('issue', '?')
+     status = item.get('status', '?')
+     pri = str(item.get('priority', '?'))
+     conf = item.get('spec_confidence', '?')
+     title = item.get('title', '')[:40]
+     notes = item.get('notes', '')
+@@ -49,6 +58,8 @@
+     if item.get('depends_on'):
+         extra.append(f'depends: {item[\"depends_on\"]}')
++    if item.get('skip_plan'):
++        extra.append('skip_plan')
+     if notes:
+         extra.append(notes)
+
+@@ -86,6 +97,7 @@
+     'notes': '',
+     'spec_confidence': 'unknown',
+     'depends_on': [],
++    'skip_plan': False,
+     'added_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+ })
+
+@@ -126,6 +138,10 @@
+         elif field == 'depends_on':
+             # Accept comma-separated list
+             value = [v.strip() for v in value.split(',') if v.strip()] if value else []
++        elif field == 'skip_plan':
++            # Accept true/false as boolean
++            value = value.lower() in ('true', '1', 'yes')
+         elif value.lower() == 'null':
+             value = None
