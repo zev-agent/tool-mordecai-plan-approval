@@ -1,0 +1,137 @@
+--- a/scripts/watch-mordecai.sh
++++ b/scripts/watch-mordecai.sh
+@@ -10,6 +10,10 @@
+ # State machine (state.json 'status' field):
+ #   active    → normal monitoring, check PR / restart / escalate
+ #   pr_open   → PR is open, check CI, notify when green
++#   planning       → Mordecai is generating the plan (agent running)
++#   awaiting_approval → plan posted to Discord, waiting for Josh's reaction
++#   correcting     → Josh reacted ✏️, Zev asked clarifying questions, waiting for answers
++#   implementing   → approved, Mordecai is coding
+ #   done      → finished, state file deleted on next run
+ #   escalated → max restarts hit, manual intervention needed
+
+@@ -24,6 +28,8 @@
+ STATE_FILE="$HOME/.config/mordecai-watcher/state.json"
+ QUEUE_SH="$SCRIPT_DIR/queue.sh"
+ OPENCLAW="$HOME/.nvm/versions/node/v25.5.0/bin/openclaw"
++PLAN_SH="$SCRIPT_DIR/mordecai-plan.sh"
++CHECK_PLAN_SH="$SCRIPT_DIR/check-plan-reaction.sh"
+
+ mkdir -p "$HOME/.config/mordecai-watcher"
+
+@@ -84,12 +90,18 @@
+     for k in ('issue', 'repo', 'title', 'spec_confidence', 'task_file', 'branch', 'notes'):
+         val = str(d.get(k) or '')
+         print(f'NEXT_{k.upper()}={shlex.quote(val)}')
++    print(f'NEXT_SKIP_PLAN={shlex.quote(str(d.get(\"skip_plan\", False)))}')
+ ")"
+
+   if [ "$NEXT_SPEC_CONFIDENCE" = "high" ]; then
+     # Auto-start Mordecai for high-confidence tasks
+     echo "Auto-advancing to issue #$NEXT_ISSUE ($NEXT_TITLE) — confidence: high"
+
++    # Check skip_plan flag — if not set, run planning phase first
++    if [ "$NEXT_SKIP_PLAN" != "True" ] && [ "$NEXT_SKIP_PLAN" != "true" ]; then
++      # Run planning phase instead of direct implementation
++      NEXT_BRANCH_NAME="${NEXT_BRANCH:-feature/issue-$NEXT_ISSUE}"
++      NEXT_WORKDIR="$HOME/mordecai/$NEXT_ISSUE-$(basename "$NEXT_BRANCH_NAME")"
++      if [ ! -d "$NEXT_WORKDIR" ]; then
++        NEXT_WORKDIR="$HOME/mordecai"
++      fi
++      NEXT_LOG="$HOME/mordecai/logs/mordecai-$NEXT_ISSUE.log"
++      mkdir -p "$(dirname "$NEXT_LOG")"
++
++      # Create new state.json with planning status
++      python3 -c "
++import json
++state = {
++    'workdir': '$NEXT_WORKDIR',
++    'task_file': '${NEXT_TASK_FILE}',
++    'repo': '$NEXT_REPO',
++    'issue': '$NEXT_ISSUE',
++    'branch': '$NEXT_BRANCH_NAME',
++    'log_file': '$NEXT_LOG',
++    'status': 'planning',
++    'restart_count': 0
++}
++with open('$STATE_FILE', 'w') as f:
++    json.dump(state, f, indent=2)
++"
++      bash "$QUEUE_SH" set "$NEXT_ISSUE" status active 2>/dev/null || true
++      bash "$QUEUE_SH" set "$NEXT_ISSUE" branch "$NEXT_BRANCH_NAME" 2>/dev/null || true
++
++      # Spawn plan generation
++      nohup bash "$PLAN_SH" "$NEXT_ISSUE" "$NEXT_REPO" "$NEXT_TASK_FILE" "$NEXT_WORKDIR" >> "$NEXT_LOG" 2>&1 &
++      notify "📋 **Queue advance:** Starting planning phase for issue #$NEXT_ISSUE ($NEXT_TITLE)."
++      return
++    fi
++
++    # skip_plan=true — go straight to implementation (existing logic follows)
+     # Build prompt from task_file or generate from queue fields
+     if [ -n "$NEXT_TASK_FILE" ] && [ -f "$NEXT_TASK_FILE" ]; then
+       NEXT_PROMPT="$(cat "$NEXT_TASK_FILE")"
+@@ -175,6 +187,47 @@
+
+ case "$STATUS" in
++  planning)
++    # Mordecai is generating a plan — check if the plan process finished
++    PLAN_PID=$(ps aux | grep "mordecai-plan.sh.*$ISSUE" | grep -v grep | awk '{print $2}' | head -1)
++    if [ -n "$PLAN_PID" ]; then
++      echo "Plan generation still running for issue #$ISSUE (PID $PLAN_PID)."
++    else
++      # Plan process finished — check if state was updated to awaiting_approval
++      CURRENT_STATUS=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('status',''))" 2>/dev/null)
++      if [ "$CURRENT_STATUS" = "awaiting_approval" ]; then
++        echo "Plan posted, now awaiting approval for issue #$ISSUE."
++      elif [ "$CURRENT_STATUS" = "escalated" ]; then
++        echo "Plan generation failed for issue #$ISSUE. Escalated."
++      else
++        echo "Plan process exited but status is '$CURRENT_STATUS'. May need investigation."
++      fi
++    fi
++    exit 0
++    ;;
++
++  awaiting_approval)
++    # Plan posted, waiting for Josh's reaction
++    REACTION_RESULT=$(bash "$CHECK_PLAN_SH" 2>/dev/null)
++    case "$REACTION_RESULT" in
++      approved)
++        echo "Plan approved for issue #$ISSUE. Starting implementation."
++        # Spawn Mordecai in full implementation mode (reuse existing restart logic)
++        FULL_PROMPT="$(cat "$TASK_FILE")
++
++## Approved plan
++$(cat "$HOME/.config/mordecai-watcher/plan-$ISSUE.json" 2>/dev/null || echo 'See Discord for plan.')
++
++Implement the plan above. Follow the plan closely."
++
++        cd "$WORKDIR"
++        nohup claude --dangerously-skip-permissions "$FULL_PROMPT" >> "$LOG_FILE" 2>&1 &
++        IMPL_PID=$!
++        agent_register mordecai "issue #$ISSUE (implementing)" "$WORKDIR" "$IMPL_PID"
++        notify "🔩 **Mordecai** starting implementation for issue #$ISSUE (PID $IMPL_PID)."
++        ;;
++      corrections)
++        echo "Corrections requested for issue #$ISSUE. Waiting for Josh's input."
++        ;;
++      *)
++        echo "Still waiting for approval on issue #$ISSUE plan."
++        ;;
++    esac
++    exit 0
++    ;;
++
++  correcting)
++    echo "Status is correcting for issue #$ISSUE. Waiting for Zev to re-run plan after Josh provides corrections."
++    exit 0
++    ;;
++
++  implementing)
++    # Treat same as active — check if Mordecai is running, handle PR, restart, etc.
++    echo "Status is implementing for issue #$ISSUE. Falling through to active monitoring."
++    ;;
++
+   pr_open)
+     echo "Status is pr_open (PR #${PR_NUMBER:-?}). Checking if merged..."
